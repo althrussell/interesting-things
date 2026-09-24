@@ -27,3 +27,19 @@ widen it once it's responsive.
 - Mask **count** is not the same as query **cost** — masks fire only on the masked columns a query selects.
 - If the notebook shows no Python / non-deterministic masks, masking is not your bottleneck — use the guide
   to chase the real cause (table statistics, data layout, shuffle/spill, warehouse sizing).
+
+## DBSQL RightSize Advisor (AI/BI dashboard)
+
+`DBSQL_RightSize_Advisor.lvdash.json` — an AI/BI (Lakeview) dashboard that reviews your SQL
+warehouses from your **own system tables** and recommends right-sizing actions.
+
+**Import:** In Databricks, go to **Dashboards → Import dashboard from file**, select this file, then
+pick a SQL warehouse to run it on.
+
+**What it shows:** KPIs (queries, spill, queue, cold-start over 7 days); a **right-size recommendation
+table** (upsize / downsize / go-serverless / adjust auto-stop per warehouse); a daily query-volume and
+queue-pressure trend; per-warehouse health; and the longest-running queries. A warehouse filter is on the
+Filters page.
+
+**Requires:** the `system.query` and `system.compute` system schemas (standard on Unity Catalog). It is
+read-only and creates nothing.

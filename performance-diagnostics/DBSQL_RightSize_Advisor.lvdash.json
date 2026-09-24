@@ -1,0 +1,1094 @@
+{
+  "datasets": [
+    {
+      "name": "ds_wh",
+      "displayName": "Warehouse pressure (7d)",
+      "queryLines": [
+        "WITH base AS (\n",
+        "  SELECT qh.compute.warehouse_id AS warehouse_id,\n",
+        "    qh.total_duration_ms,\n",
+        "    COALESCE(qh.waiting_for_compute_duration_ms,0) AS wait_cold_ms,\n",
+        "    COALESCE(qh.waiting_at_capacity_duration_ms,0) AS wait_cap_ms,\n",
+        "    COALESCE(qh.spilled_local_bytes,0) AS spilled_local_bytes\n",
+        "  FROM system.query.history qh\n",
+        "  WHERE qh.start_time >= date_sub(current_date(), 7)\n",
+        "    AND qh.compute.type='WAREHOUSE' AND qh.compute.warehouse_id IS NOT NULL\n",
+        "),\n",
+        "wh AS (\n",
+        "  SELECT warehouse_id, warehouse_name, warehouse_type, UPPER(warehouse_size) AS warehouse_size,\n",
+        "    min_clusters, max_clusters, auto_stop_minutes,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n",
+        "  FROM system.compute.warehouses WHERE delete_time IS NULL\n",
+        ")\n",
+        "SELECT COALESCE(w.warehouse_name, base.warehouse_id) AS warehouse_name,\n",
+        "  w.warehouse_type, w.warehouse_size, w.min_clusters, w.max_clusters, w.auto_stop_minutes,\n",
+        "  COUNT(*) AS queries,\n",
+        "  ROUND(SUM(base.spilled_local_bytes)/POWER(1024.0,3),2) AS spill_gib,\n",
+        "  ROUND(SUM(base.wait_cap_ms)/60000.0,2) AS capacity_queue_minutes,\n",
+        "  ROUND(SUM(base.wait_cold_ms)/60000.0,2) AS coldstart_minutes,\n",
+        "  ROUND((SUM(base.wait_cap_ms)+SUM(base.wait_cold_ms))/60000.0,2) AS queue_minutes,\n",
+        "  ROUND(AVG(base.total_duration_ms)/1000.0,2) AS avg_runtime_sec\n",
+        "FROM base LEFT JOIN wh w ON w.warehouse_id=base.warehouse_id AND w.rn=1\n",
+        "GROUP BY 1,2,3,4,5,6 ORDER BY queries DESC\n"
+      ],
+      "columns": [
+        {
+          "displayName": "Total Queries",
+          "expression": "SUM(`queries`)"
+        },
+        {
+          "displayName": "Total Spill GiB",
+          "expression": "SUM(`spill_gib`)"
+        },
+        {
+          "displayName": "Total Queue Min",
+          "expression": "SUM(`queue_minutes`)"
+        },
+        {
+          "displayName": "Total Coldstart Min",
+          "expression": "SUM(`coldstart_minutes`)"
+        }
+      ]
+    },
+    {
+      "name": "ds_trend",
+      "displayName": "Daily trend (14d)",
+      "queryLines": [
+        "SELECT DATE_TRUNC('DAY', qh.start_time) AS day,\n",
+        "  COUNT(*) AS queries,\n",
+        "  ROUND(SUM(COALESCE(qh.spilled_local_bytes,0))/POWER(1024.0,3),2) AS spill_gib,\n",
+        "  ROUND(SUM(COALESCE(qh.waiting_at_capacity_duration_ms,0)+COALESCE(qh.waiting_for_compute_duration_ms,0))/60000.0,2) AS queue_minutes\n",
+        "FROM system.query.history qh\n",
+        "WHERE qh.start_time >= date_sub(current_date(), 14)\n",
+        "  AND qh.compute.type='WAREHOUSE' AND qh.compute.warehouse_id IS NOT NULL\n",
+        "GROUP BY 1 ORDER BY 1\n"
+      ]
+    },
+    {
+      "name": "ds_reco",
+      "displayName": "Right-size recommendations",
+      "queryLines": [
+        "WITH params AS (\n",
+        "  SELECT 1.0 AS spill_gib_threshold, 10.0 AS capacity_queue_min_threshold, 5.0 AS coldstart_min_threshold,\n",
+        "         0.1 AS low_spill_gib_threshold, 1.0 AS low_capacity_queue_min_threshold, 1.0 AS low_total_queue_min_threshold\n",
+        "),\n",
+        "base_wh AS (\n",
+        "  SELECT qh.statement_id, qh.workspace_id, qh.compute.warehouse_id AS warehouse_id, qh.start_time, qh.execution_status,\n",
+        "    qh.total_duration_ms,\n",
+        "    COALESCE(qh.waiting_for_compute_duration_ms,0) AS wait_cold_ms,\n",
+        "    COALESCE(qh.waiting_at_capacity_duration_ms,0) AS wait_cap_ms,\n",
+        "    (COALESCE(qh.waiting_for_compute_duration_ms,0)+COALESCE(qh.waiting_at_capacity_duration_ms,0)) AS queue_ms,\n",
+        "    COALESCE(qh.spilled_local_bytes,0) AS spilled_local_bytes\n",
+        "  FROM system.query.history qh\n",
+        "  WHERE qh.start_time >= current_timestamp() - INTERVAL 7 DAYS\n",
+        "    AND qh.compute.type = 'WAREHOUSE' AND qh.compute.warehouse_id IS NOT NULL\n",
+        "),\n",
+        "wh_pti AS (\n",
+        "  SELECT b.statement_id, cw.warehouse_name, cw.warehouse_type, cw.warehouse_channel, UPPER(cw.warehouse_size) AS warehouse_size,\n",
+        "         cw.min_clusters, cw.max_clusters, cw.auto_stop_minutes,\n",
+        "         ROW_NUMBER() OVER (PARTITION BY b.statement_id ORDER BY cw.change_time DESC) AS rn\n",
+        "  FROM base_wh b\n",
+        "  LEFT JOIN system.compute.warehouses cw\n",
+        "    ON cw.workspace_id = b.workspace_id AND cw.warehouse_id = b.warehouse_id AND cw.change_time <= b.start_time\n",
+        "),\n",
+        "joined AS (\n",
+        "  SELECT b.workspace_id, b.warehouse_id, p.warehouse_name, p.warehouse_type, p.warehouse_channel,\n",
+        "         p.warehouse_size, p.min_clusters, p.max_clusters, p.auto_stop_minutes,\n",
+        "         b.total_duration_ms, b.wait_cold_ms, b.wait_cap_ms, b.queue_ms, b.spilled_local_bytes\n",
+        "  FROM base_wh b LEFT JOIN wh_pti p ON p.statement_id = b.statement_id AND p.rn = 1\n",
+        "),\n",
+        "agg AS (\n",
+        "  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_channel,\n",
+        "         warehouse_size, min_clusters, max_clusters, auto_stop_minutes,\n",
+        "         COUNT(*) AS queries, SUM(queue_ms)/60000.0 AS queue_minutes, SUM(wait_cold_ms)/60000.0 AS coldstart_minutes,\n",
+        "         SUM(wait_cap_ms)/60000.0 AS capacity_queue_minutes,\n",
+        "         CAST(SUM(spilled_local_bytes) AS BIGINT)/POWER(1024.0,3) AS spill_gib,\n",
+        "         AVG(total_duration_ms)/1000.0 AS avg_runtime_sec\n",
+        "  FROM joined\n",
+        "  GROUP BY workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_channel,\n",
+        "           warehouse_size, min_clusters, max_clusters, auto_stop_minutes\n",
+        "),\n",
+        "sized AS (\n",
+        "  SELECT a.*,\n",
+        "    CASE warehouse_size WHEN '2X_SMALL' THEN 'X_SMALL' WHEN 'X_SMALL' THEN 'SMALL' WHEN 'SMALL' THEN 'MEDIUM'\n",
+        "      WHEN 'MEDIUM' THEN 'LARGE' WHEN 'LARGE' THEN 'X_LARGE' WHEN 'X_LARGE' THEN '2X_LARGE'\n",
+        "      WHEN '2X_LARGE' THEN '3X_LARGE' WHEN '3X_LARGE' THEN '4X_LARGE' ELSE NULL END AS next_size,\n",
+        "    CASE warehouse_size WHEN 'X_SMALL' THEN '2X_SMALL' WHEN 'SMALL' THEN 'X_SMALL' WHEN 'MEDIUM' THEN 'SMALL'\n",
+        "      WHEN 'LARGE' THEN 'MEDIUM' WHEN 'X_LARGE' THEN 'LARGE' WHEN '2X_LARGE' THEN 'X_LARGE'\n",
+        "      WHEN '3X_LARGE' THEN '2X_LARGE' WHEN '4X_LARGE' THEN '3X_LARGE' ELSE NULL END AS prev_size\n",
+        "  FROM agg a\n",
+        "),\n",
+        "scored AS (SELECT s.*, p.* FROM sized s CROSS JOIN params p),\n",
+        "flags AS (\n",
+        "  SELECT s.*,\n",
+        "    (s.spill_gib >= s.spill_gib_threshold) AS f_spill,\n",
+        "    (s.capacity_queue_minutes >= s.capacity_queue_min_threshold) AS f_capacity,\n",
+        "    (s.coldstart_minutes >= s.coldstart_min_threshold) AS f_cold,\n",
+        "    (s.spill_gib <= s.low_spill_gib_threshold AND s.capacity_queue_minutes <= s.low_capacity_queue_min_threshold\n",
+        "      AND s.queue_minutes <= s.low_total_queue_min_threshold) AS f_low,\n",
+        "    (s.coldstart_minutes >= s.coldstart_min_threshold AND COALESCE(s.auto_stop_minutes,0) <= 15\n",
+        "      AND s.warehouse_type <> 'SERVERLESS') AS f_autostop_increase,\n",
+        "    ((s.spill_gib <= s.low_spill_gib_threshold AND s.capacity_queue_minutes <= s.low_capacity_queue_min_threshold\n",
+        "      AND s.queue_minutes <= s.low_total_queue_min_threshold) AND COALESCE(s.auto_stop_minutes,0) >= 60) AS f_autostop_decrease\n",
+        "  FROM scored s\n",
+        ")\n",
+        "SELECT warehouse_id, warehouse_name, warehouse_type, warehouse_size, min_clusters, max_clusters, auto_stop_minutes,\n",
+        "  queries, ROUND(spill_gib,2) AS spill_gib, ROUND(queue_minutes,2) AS queue_minutes,\n",
+        "  ROUND(coldstart_minutes,2) AS coldstart_minutes, ROUND(capacity_queue_minutes,2) AS capacity_queue_minutes,\n",
+        "  CASE\n",
+        "    WHEN f_cold AND warehouse_type <> 'SERVERLESS' THEN 'Recommend SERVERLESS (cold starts high; if staying Classic/Pro, increase auto-stop to 60)'\n",
+        "    WHEN f_spill AND f_capacity AND next_size IS NOT NULL THEN CONCAT('Upsize to ', next_size, ' and raise max_clusters to ', COALESCE(CAST(max_clusters+1 AS STRING),'?'))\n",
+        "    WHEN f_spill AND next_size IS NOT NULL THEN CONCAT('Upsize to ', next_size)\n",
+        "    WHEN f_capacity THEN CONCAT('Raise max_clusters to ', COALESCE(CAST(max_clusters+1 AS STRING),'?'))\n",
+        "    WHEN f_low AND prev_size IS NOT NULL THEN CONCAT('Consider downsizing to ', prev_size)\n",
+        "    WHEN f_autostop_increase THEN 'Increase auto-stop to 60 (reduce cold starts)'\n",
+        "    WHEN f_autostop_decrease THEN 'Decrease auto-stop to 30 (reduce idle cost)'\n",
+        "    ELSE 'No change' END AS recommended_action\n",
+        "FROM flags\n",
+        "WHERE (f_cold AND warehouse_type <> 'SERVERLESS') OR f_capacity OR (f_spill AND next_size IS NOT NULL)\n",
+        "   OR (f_low AND prev_size IS NOT NULL) OR f_autostop_increase OR f_autostop_decrease\n",
+        "ORDER BY f_capacity DESC, f_spill DESC, capacity_queue_minutes DESC, spill_gib DESC\n",
+        "LIMIT 200;\n"
+      ]
+    },
+    {
+      "name": "ds_long",
+      "displayName": "Longest-running queries",
+      "queryLines": [
+        "WITH wh AS (\n",
+        "  SELECT warehouse_id, warehouse_name,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) rn\n",
+        "  FROM system.compute.warehouses WHERE delete_time IS NULL\n",
+        ")\n",
+        "SELECT COALESCE(w.warehouse_name, qh.compute.warehouse_id) AS warehouse_name,\n",
+        "  qh.executed_by,\n",
+        "  ROUND(qh.total_duration_ms/1000.0,1) AS duration_sec,\n",
+        "  ROUND(COALESCE(qh.waiting_at_capacity_duration_ms,0)/1000.0,1) AS queue_sec,\n",
+        "  ROUND(COALESCE(qh.spilled_local_bytes,0)/POWER(1024.0,3),2) AS spill_gib,\n",
+        "  LEFT(REPLACE(qh.statement_text,'\\n',' '),120) AS statement_preview\n",
+        "FROM system.query.history qh\n",
+        "LEFT JOIN wh w ON w.warehouse_id=qh.compute.warehouse_id AND w.rn=1\n",
+        "WHERE qh.start_time >= date_sub(current_date(), 7)\n",
+        "  AND qh.compute.type='WAREHOUSE' AND qh.execution_status='FINISHED' AND qh.compute.warehouse_id IS NOT NULL\n",
+        "ORDER BY qh.total_duration_ms DESC LIMIT 50\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "advisor",
+      "displayName": "DBSQL RightSize Advisor",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# DBSQL Warehouse RightSize Advisor\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Self-serve warehouse health & sizing from your own system tables (`system.query.history` + `system.compute.warehouses`). Metrics cover the **last 7 days** (14-day daily trend). Read-only.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_q",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "measure(Total Queries)",
+                      "expression": "MEASURE(`Total Queries`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "measure(Total Queries)",
+                  "displayName": "Queries (7d)"
+                }
+              },
+              "frame": {
+                "title": "Queries (7d)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_spill",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "measure(Total Spill GiB)",
+                      "expression": "MEASURE(`Total Spill GiB`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "measure(Total Spill GiB)",
+                  "displayName": "Spill (GiB)",
+                  "format": {
+                    "type": "number",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Spill (GiB)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_queue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "measure(Total Queue Min)",
+                      "expression": "MEASURE(`Total Queue Min`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "measure(Total Queue Min)",
+                  "displayName": "Queue (min)",
+                  "format": {
+                    "type": "number",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Queue (min)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_cold",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "measure(Total Coldstart Min)",
+                      "expression": "MEASURE(`Total Coldstart Min`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "measure(Total Coldstart Min)",
+                  "displayName": "Cold-start (min)",
+                  "format": {
+                    "type": "number",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "title": "Cold-start (min)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 2,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "h_reco",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Right-size recommendations\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "t_reco",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_reco",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    },
+                    {
+                      "name": "warehouse_type",
+                      "expression": "`warehouse_type`"
+                    },
+                    {
+                      "name": "warehouse_size",
+                      "expression": "`warehouse_size`"
+                    },
+                    {
+                      "name": "max_clusters",
+                      "expression": "`max_clusters`"
+                    },
+                    {
+                      "name": "auto_stop_minutes",
+                      "expression": "`auto_stop_minutes`"
+                    },
+                    {
+                      "name": "queries",
+                      "expression": "`queries`"
+                    },
+                    {
+                      "name": "spill_gib",
+                      "expression": "`spill_gib`"
+                    },
+                    {
+                      "name": "queue_minutes",
+                      "expression": "`queue_minutes`"
+                    },
+                    {
+                      "name": "coldstart_minutes",
+                      "expression": "`coldstart_minutes`"
+                    },
+                    {
+                      "name": "recommended_action",
+                      "expression": "`recommended_action`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "warehouse_name",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "warehouse_type",
+                    "displayName": "Type"
+                  },
+                  {
+                    "fieldName": "warehouse_size",
+                    "displayName": "Size"
+                  },
+                  {
+                    "fieldName": "max_clusters",
+                    "displayName": "Max clusters"
+                  },
+                  {
+                    "fieldName": "auto_stop_minutes",
+                    "displayName": "Auto-stop (min)"
+                  },
+                  {
+                    "fieldName": "queries",
+                    "displayName": "Queries"
+                  },
+                  {
+                    "fieldName": "spill_gib",
+                    "displayName": "Spill GiB",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "queue_minutes",
+                    "displayName": "Queue min",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "coldstart_minutes",
+                    "displayName": "Cold-start min",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "recommended_action",
+                    "displayName": "Recommended action"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Recommended actions (priority-ordered)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "h_trend",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Daily trend (last 14 days)\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "c_qvol",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_trend",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(queries)",
+                      "expression": "SUM(`queries`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Day"
+                },
+                "y": {
+                  "fieldName": "sum(queries)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Queries"
+                }
+              },
+              "frame": {
+                "title": "Query volume by day",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "c_queue",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_trend",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(queue_minutes)",
+                      "expression": "SUM(`queue_minutes`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Day"
+                },
+                "y": {
+                  "fieldName": "sum(queue_minutes)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Queue minutes"
+                }
+              },
+              "frame": {
+                "title": "Queue pressure by day",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 13,
+            "width": 6,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "h_health",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Per-warehouse health (7d)\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 18,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "t_health",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    },
+                    {
+                      "name": "warehouse_type",
+                      "expression": "`warehouse_type`"
+                    },
+                    {
+                      "name": "warehouse_size",
+                      "expression": "`warehouse_size`"
+                    },
+                    {
+                      "name": "min_clusters",
+                      "expression": "`min_clusters`"
+                    },
+                    {
+                      "name": "max_clusters",
+                      "expression": "`max_clusters`"
+                    },
+                    {
+                      "name": "auto_stop_minutes",
+                      "expression": "`auto_stop_minutes`"
+                    },
+                    {
+                      "name": "queries",
+                      "expression": "`queries`"
+                    },
+                    {
+                      "name": "spill_gib",
+                      "expression": "`spill_gib`"
+                    },
+                    {
+                      "name": "capacity_queue_minutes",
+                      "expression": "`capacity_queue_minutes`"
+                    },
+                    {
+                      "name": "coldstart_minutes",
+                      "expression": "`coldstart_minutes`"
+                    },
+                    {
+                      "name": "queue_minutes",
+                      "expression": "`queue_minutes`"
+                    },
+                    {
+                      "name": "avg_runtime_sec",
+                      "expression": "`avg_runtime_sec`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "warehouse_name",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "warehouse_type",
+                    "displayName": "Type"
+                  },
+                  {
+                    "fieldName": "warehouse_size",
+                    "displayName": "Size"
+                  },
+                  {
+                    "fieldName": "min_clusters",
+                    "displayName": "Min cl"
+                  },
+                  {
+                    "fieldName": "max_clusters",
+                    "displayName": "Max cl"
+                  },
+                  {
+                    "fieldName": "auto_stop_minutes",
+                    "displayName": "Auto-stop"
+                  },
+                  {
+                    "fieldName": "queries",
+                    "displayName": "Queries"
+                  },
+                  {
+                    "fieldName": "spill_gib",
+                    "displayName": "Spill GiB",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "capacity_queue_minutes",
+                    "displayName": "Capacity-queue min",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "coldstart_minutes",
+                    "displayName": "Cold-start min",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "queue_minutes",
+                    "displayName": "Total queue min",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "avg_runtime_sec",
+                    "displayName": "Avg runtime s",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Per-warehouse health",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 19,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "h_long",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Longest-running queries (7d)\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 25,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "t_long",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_long",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    },
+                    {
+                      "name": "executed_by",
+                      "expression": "`executed_by`"
+                    },
+                    {
+                      "name": "duration_sec",
+                      "expression": "`duration_sec`"
+                    },
+                    {
+                      "name": "queue_sec",
+                      "expression": "`queue_sec`"
+                    },
+                    {
+                      "name": "spill_gib",
+                      "expression": "`spill_gib`"
+                    },
+                    {
+                      "name": "statement_preview",
+                      "expression": "`statement_preview`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "warehouse_name",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "executed_by",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "duration_sec",
+                    "displayName": "Duration s",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "queue_sec",
+                    "displayName": "Queue s",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "spill_gib",
+                    "displayName": "Spill GiB",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "statement_preview",
+                    "displayName": "Statement"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Top 50 longest-running queries",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 26,
+            "width": 12,
+            "height": 6
+          }
+        }
+      ]
+    },
+    {
+      "name": "filters",
+      "displayName": "Filters",
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "f_wh",
+            "queries": [
+              {
+                "name": "q_wh",
+                "query": {
+                  "datasetName": "ds_wh",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_reco",
+                "query": {
+                  "datasetName": "ds_reco",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "q_long",
+                "query": {
+                  "datasetName": "ds_long",
+                  "fields": [
+                    {
+                      "name": "warehouse_name",
+                      "expression": "`warehouse_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "warehouse_name",
+                    "queryName": "q_wh",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "warehouse_name",
+                    "queryName": "q_reco"
+                  },
+                  {
+                    "fieldName": "warehouse_name",
+                    "queryName": "q_long"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Warehouse",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#FCFCFC",
+        "dark": "#1F272D"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#11171C",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#FF3621",
+        "dark": "#FF8A7A"
+      },
+      "visualizationColors": [
+        "#FF3621",
+        "#1B3139",
+        "#FFA600",
+        "#00A972",
+        "#2272B4",
+        "#995495",
+        "#5ADBFF"
+      ],
+      "widgetHeaderAlignment": "LEFT"
+    }
+  }
+}
