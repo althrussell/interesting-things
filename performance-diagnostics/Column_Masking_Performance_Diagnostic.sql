@@ -122,7 +122,8 @@ SELECT DISTINCT
 FROM system.information_schema.routines r
 JOIN (SELECT DISTINCT mask_name AS fn FROM system.information_schema.column_masks) m
   ON concat(r.routine_catalog, '.', r.routine_schema, '.', r.routine_name) = m.fn
-WHERE r.external_language = 'Python' OR r.is_deterministic = 'NO'
+WHERE (r.external_language = 'Python' OR lower(r.is_deterministic) IN ('no', 'false'))
+  AND r.routine_catalog <> 'system'   -- exclude Databricks' own built-in system masks (not yours to change)
 ORDER BY r.external_language DESC NULLS LAST, r.is_deterministic;
 
 -- COMMAND ----------
