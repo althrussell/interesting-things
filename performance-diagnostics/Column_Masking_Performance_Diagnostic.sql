@@ -203,6 +203,89 @@ LIMIT 30;
 -- COMMAND ----------
 
 -- MAGIC %md
+-- MAGIC ## 7. Maintenance & Predictive Optimization — are OPTIMIZE / VACUUM / ANALYZE running?
+-- MAGIC Stale or missing table maintenance is one of the most common causes of slow queries: no `OPTIMIZE`/liquid
+-- MAGIC clustering means small files and poor pruning, and stale `ANALYZE` means the optimizer plans blind.
+-- MAGIC [Predictive Optimization](https://docs.databricks.com/aws/en/optimizations/predictive-optimization) runs
+-- MAGIC these for you on managed tables. **This first query shows whether it is running at all** (last 30 days).
+-- MAGIC If it returns no rows, no automatic maintenance is happening anywhere.
+
+-- COMMAND ----------
+
+SELECT
+  operation_type,
+  count(*)                                                            AS operations,
+  count(DISTINCT concat(catalog_name,'.',schema_name,'.',table_name)) AS tables,
+  date(max(end_time))                                                 AS most_recent
+FROM system.storage.predictive_optimization_operations_history
+WHERE end_time > current_timestamp() - INTERVAL 30 DAYS
+GROUP BY operation_type
+ORDER BY operations DESC;
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ### Are your hottest tables actually being maintained?
+-- MAGIC Joins your hot tables (as in Section 1) to their last `OPTIMIZE`/`VACUUM`/`ANALYZE`. A blank date or
+-- MAGIC **`NOT maintained by PO`** on a hot table — or a `last_analyze` months behind `last_optimize` — is a
+-- MAGIC direct "you are not doing what you need" signal. (Databricks-managed `system.*` tables are expected to
+-- MAGIC show as not-PO-maintained; focus on your own catalogs. Manually-run maintenance appears in Section 7c.)
+
+-- COMMAND ----------
+
+WITH slow AS (
+  SELECT statement_id, execution_duration_ms FROM system.query.history
+  WHERE start_time > current_timestamp() - INTERVAL 3 DAYS AND statement_type = 'SELECT'
+    AND execution_status = 'FINISHED' AND from_result_cache = false AND execution_duration_ms > 2000
+),
+lin AS (
+  SELECT DISTINCT statement_id, source_table_full_name FROM system.access.table_lineage
+  WHERE event_date > current_date() - INTERVAL 4 DAYS AND source_table_full_name IS NOT NULL
+),
+hot AS (
+  SELECT l.source_table_full_name AS tbl, count(*) AS slow_queries,
+         round(sum(s.execution_duration_ms)/1000.0, 1) AS total_exec_s
+  FROM slow s JOIN lin l USING (statement_id) GROUP BY 1
+),
+maint AS (
+  SELECT lower(concat(catalog_name,'.',schema_name,'.',table_name)) AS tbl,
+         max(CASE WHEN operation_type IN ('COMPACTION','CLUSTERING') THEN end_time END) AS last_optimize,
+         max(CASE WHEN operation_type = 'VACUUM' THEN end_time END)                     AS last_vacuum,
+         max(CASE WHEN operation_type = 'ANALYZE' THEN end_time END)                    AS last_analyze
+  FROM system.storage.predictive_optimization_operations_history
+  WHERE operation_status = 'SUCCESSFUL' GROUP BY 1
+)
+SELECT h.tbl, h.slow_queries, h.total_exec_s,
+       date(m.last_optimize) AS last_optimize,
+       date(m.last_vacuum)   AS last_vacuum,
+       date(m.last_analyze)  AS last_analyze,
+       CASE WHEN m.tbl IS NULL THEN 'NOT maintained by PO' ELSE 'maintained' END AS maintenance
+FROM hot h LEFT JOIN maint m ON lower(h.tbl) = m.tbl
+ORDER BY h.total_exec_s DESC
+LIMIT 30;
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ### 7c. Manual maintenance (if you don't use Predictive Optimization)
+-- MAGIC If Section 7's PO history is sparse, check whether maintenance is being run by hand. Nothing here **and**
+-- MAGIC nothing in the PO history means the table is not being maintained at all.
+
+-- COMMAND ----------
+
+SELECT
+  regexp_extract(statement_text, '(?i)^\\s*(optimize|vacuum|analyze)', 1) AS operation,
+  count(*)              AS runs,
+  date(max(start_time)) AS most_recent
+FROM system.query.history
+WHERE (statement_text ILIKE 'OPTIMIZE %' OR statement_text ILIKE 'VACUUM %' OR statement_text ILIKE 'ANALYZE %')
+  AND start_time > current_timestamp() - INTERVAL 30 DAYS
+GROUP BY 1
+ORDER BY runs DESC;
+
+-- COMMAND ----------
+
+-- MAGIC %md
 -- MAGIC ## How to read your results
 -- MAGIC
 -- MAGIC 1. **Section 3 returns no rows** (no Python / non-deterministic masks) → column masking is **not** your
