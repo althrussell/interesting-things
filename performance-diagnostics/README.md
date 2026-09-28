@@ -43,3 +43,24 @@ Filters page.
 
 **Requires:** the `system.query` and `system.compute` system schemas (standard on Unity Catalog). It is
 read-only and creates nothing.
+
+## Platform Health Check (notebook)
+
+`Platform_Health_Check.ipynb` (Jupyter) / `Platform_Health_Check.py` (Databricks source) — a self-service
+platform maturity review that reads your **own system tables** and produces a single **ranked list of things
+to fix** (P1 / P2 / P3), each with evidence, the affected object and a recommended action.
+
+**What it checks:** table inventory (Delta, managed vs external, Hive metastore); Hive metastore and
+path-based access; hot tables by read/write volume; a per-table deep dive (file sizes, clustering,
+predictive optimisation, OPTIMIZE/VACUUM history); predictive optimisation failures; ingestion patterns;
+compute (runtime end-of-support, access modes, policies, utilisation); jobs (failures, skipped runs, cost,
+bundles, health rules); SQL warehouses and query performance by client; and spend at list price.
+
+**How to run:** import into Databricks, attach to **serverless** (or a UC cluster on DBR 15.4 LTS+), set the
+widgets (`workspace_ids` = `all` | `current` | comma list, `lookback_days`, `top_n_tables`) and Run all.
+Every system-table query is date- and workspace-scoped; typical runtime is 5–15 minutes. It is **read-only**
+(`SELECT` / `SHOW` / `DESCRIBE`) unless you set `output_table` to keep a history of findings. Missing
+system schemas or permissions skip the affected check and are listed in the check log.
+
+**Requires:** the `access`, `query`, `compute`, `lakeflow`, `storage` and `billing` system schemas. Run as an
+admin for full coverage: query text is redacted for non-privileged users.
