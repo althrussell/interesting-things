@@ -58,7 +58,10 @@ bundles, health rules); SQL warehouses and query performance by client; and spen
 
 **How to run:** import into Databricks, attach to **serverless** (or a UC cluster on DBR 15.4 LTS+), set the
 widgets (`workspace_ids` = `all` | `current` | comma list, `lookback_days`, `top_n_tables`) and Run all.
-Every system-table query is date- and workspace-scoped; typical runtime is 5–15 minutes. It is **read-only**
+Every system-table query is date- and workspace-scoped; typical runtime is 5–15 minutes. On large estates,
+use the optional `catalogs` and `schemas` widgets (comma lists; a schema can be `schema` or `catalog.schema`)
+to limit the table-level checks (inventory, hot tables, deep dive, predictive optimisation) to part of the
+estate. Compute, jobs, warehouse and billing checks are workspace-level and ignore them. It is **read-only**
 (`SELECT` / `SHOW` / `DESCRIBE`) unless you set `output_table` to keep a history of findings. Missing
 system schemas or permissions skip the affected check and are listed in the check log.
 

@@ -12,7 +12,8 @@
 # MAGIC 1. Attach the notebook to **serverless** compute, or to a Unity Catalog-enabled cluster on DBR 15.4 LTS or later.
 # MAGIC 2. Set the widgets at the top:
 # MAGIC    - `workspace_ids`: `all` covers every workspace in the account. Use a comma list, e.g. `1234567890123456,6543210987654321`, or `current` for this workspace only.
-# MAGIC    - `lookback_days`: default 90.
+# MAGIC    - `lookback_days`: default 90. This is the biggest runtime lever on large accounts.
+# MAGIC    - `catalogs` / `schemas` (optional): limit the table-level checks to part of the estate. Blank means all. Use comma lists, e.g. `prod_gold,prod_silver` and `sales,finance.reporting`. A schema can be a bare name, which matches in any selected catalog, or `catalog.schema`.
 # MAGIC 3. Choose **Run all**. It typically takes 5-15 minutes.
 # MAGIC
 # MAGIC The final section shows the ranked findings and the result of each check.
@@ -25,6 +26,7 @@
 # MAGIC
 # MAGIC **Scope and limits**
 # MAGIC - Every system-table query is limited by date (`lookback_days`) and workspace (`workspace_ids`).
+# MAGIC - `catalogs` / `schemas` apply to the table-level checks: sections 1a, 3 and 4, and 5a. The Hive metastore checks (1b, 2a) always run. Path-based reads (2b), SQL command history (5b), and ingestion, compute, jobs, SQL warehouses and billing (6-10) are workspace-level, so they use the workspace and date filters only.
 # MAGIC - `system.query.history` covers SQL warehouses and serverless compute. Workloads on classic job or all-purpose clusters appear in the jobs, compute and billing checks. They don't appear in the query-level checks.
 # MAGIC - `$` figures are at **list price** and exclude any discounts.
 # MAGIC
@@ -40,6 +42,8 @@ dbutils.widgets.text("workspace_ids", "all", "2. Workspace IDs (all | current | 
 dbutils.widgets.text("top_n_tables", "25", "3. Top N hot tables to inspect")
 dbutils.widgets.dropdown("inspect_tables", "yes", ["yes", "no"], "4. Run per-table DESCRIBE deep dive")
 dbutils.widgets.text("output_table", "", "5. Optional: save findings to catalog.schema.table")
+dbutils.widgets.text("catalogs", "", "6. Optional: catalogs to include (comma list; blank = all)")
+dbutils.widgets.text("schemas", "", "7. Optional: schemas to include (schema or catalog.schema; blank = all)")
 
 # COMMAND ----------
 
@@ -74,6 +78,29 @@ else:
 def ws(col="workspace_id"):
     """Workspace filter fragment, applied to every system table query."""
     return f"AND {col} IN ({','.join(repr(w) for w in WS_IDS)})" if WS_IDS else ""
+
+
+def _names(widget):
+    return [n.strip().strip("`").lower() for n in dbutils.widgets.get(widget).split(",") if n.strip().strip("`")]
+
+
+CATALOGS = _names("catalogs")
+SCHEMAS = [s for s in _names("schemas") if "." not in s]           # bare schema: any selected catalog
+CAT_SCHEMAS = [s for s in _names("schemas") if s.count(".") == 1]  # catalog.schema: exact pair
+_sql_list = lambda xs: ",".join("'" + x.replace("'", "''") + "'" for x in xs)
+
+
+def uc(cat_col, sch_col):
+    """Catalog/schema filter fragment for table-level queries (blank widgets = no filter)."""
+    f = f" AND lower({cat_col}) IN ({_sql_list(CATALOGS)})" if CATALOGS else ""
+    parts = ([f"lower({sch_col}) IN ({_sql_list(SCHEMAS)})"] if SCHEMAS else []) + \
+            ([f"lower(concat({cat_col}, '.', {sch_col})) IN ({_sql_list(CAT_SCHEMAS)})"] if CAT_SCHEMAS else [])
+    return f + (f" AND ({' OR '.join(parts)})" if parts else "")
+
+
+UC_FILTERED = bool(CATALOGS or SCHEMAS or CAT_SCHEMAS)
+UC_SCOPE = "; ".join(filter(None, [f"catalogs={','.join(CATALOGS)}" if CATALOGS else "",
+                                   f"schemas={','.join(SCHEMAS + CAT_SCHEMAS)}" if SCHEMAS or CAT_SCHEMAS else ""])) or "all"
 
 
 D = LOOKBACK
@@ -143,7 +170,7 @@ for t in SYSTEM_TABLES:
                     "Enable the system schema and grant SELECT, then re-run this notebook for full coverage.", 2, 2, "S")
 ok = lambda t: AVAIL.get(t) == "available"
 
-print(f"Lookback: {D} days | Workspaces: {WS_IDS or 'all in account'} | Top N tables: {TOP_N} | Deep dive: {INSPECT}")
+print(f"Lookback: {D} days | Workspaces: {WS_IDS or 'all in account'} | Tables: {UC_SCOPE} | Top N tables: {TOP_N} | Deep dive: {INSPECT}")
 display(pd.DataFrame([{"system_table": k, "status": v} for k, v in AVAIL.items()]))
 
 # COMMAND ----------
@@ -155,11 +182,12 @@ display(pd.DataFrame([{"system_table": k, "status": v} for k, v in AVAIL.items()
 
 inv = pd.DataFrame()
 if ok("system.information_schema.tables"):
-    inv = q("1a Table inventory", """
+    inv_f = uc("table_catalog", "table_schema")
+    inv = q("1a Table inventory", f"""
         SELECT table_catalog, table_type, data_source_format, COUNT(*) AS tables
         FROM system.information_schema.tables
         WHERE table_schema <> 'information_schema'
-          AND table_catalog NOT IN ('system', 'samples', '__databricks_internal')
+          AND table_catalog NOT IN ('system', 'samples', '__databricks_internal') {inv_f}
         GROUP BY ALL ORDER BY tables DESC""")
 
 if len(inv):
@@ -249,16 +277,25 @@ if ok("system.access.table_lineage"):
 
 hot_read = hot_write = pd.DataFrame()
 if ok("system.query.history") and ok("system.access.table_lineage"):
+    src_f, tgt_f = uc("source_table_catalog", "source_table_schema"), uc("target_table_catalog", "target_table_schema")
+    lin_f = f"AND ((1=1 {src_f}) OR (1=1 {tgt_f}))" if UC_FILTERED else ""
+    qh_f = "AND statement_id IN (SELECT statement_id FROM lin)" if UC_FILTERED else ""  # only statements touching in-scope tables
     base_cte = f"""
-        WITH qh AS (
+        WITH lin AS (
+          SELECT DISTINCT statement_id,
+                 CASE WHEN 1=1 {src_f} THEN source_table_full_name END AS source_table_full_name,
+                 source_table_catalog,
+                 CASE WHEN 1=1 {tgt_f} THEN target_table_full_name END AS target_table_full_name,
+                 target_table_catalog
+          FROM system.access.table_lineage
+          WHERE event_date >= current_date() - {D} {ws()} AND statement_id IS NOT NULL
+            {lin_f}),
+        qh AS (
           SELECT statement_id, client_application, statement_type, read_files, pruned_files, read_bytes,
                  total_duration_ms, written_files, written_bytes
           FROM system.query.history
-          WHERE start_time >= current_date() - INTERVAL {D} DAYS {ws()} AND execution_status = 'FINISHED'),
-        lin AS (
-          SELECT DISTINCT statement_id, source_table_full_name, source_table_catalog, target_table_full_name, target_table_catalog
-          FROM system.access.table_lineage
-          WHERE event_date >= current_date() - {D} {ws()} AND statement_id IS NOT NULL)"""
+          WHERE start_time >= current_date() - INTERVAL {D} DAYS {ws()} AND execution_status = 'FINISHED'
+            {qh_f})"""
     hot_read = q("3a Hot tables by read volume", base_cte + f"""
         SELECT l.source_table_full_name AS table_name, COUNT(DISTINCT qh.statement_id) AS queries,
                COUNT(DISTINCT qh.client_application) AS clients, concat_ws(', ', slice(collect_set(qh.client_application), 1, 4)) AS top_clients,
@@ -304,6 +341,7 @@ if len(hot_write):
 detail = pd.DataFrame()
 if INSPECT:
     cands = list(dict.fromkeys(list(hot_read.get("table_name", [])) + list(hot_write.get("table_name", []))))
+    n_hot = len(cands)
     if cands and ok("system.information_schema.tables"):
         # Keep only tables that still exist and support DESCRIBE DETAIL (not views)
         names = ",".join("'" + c.replace("'", "''") + "'" for c in cands)
@@ -337,7 +375,8 @@ if INSPECT:
         rows.append(rec)
     detail = pd.DataFrame(rows)
     CHECK_LOG.append(dict(check="4 Table deep dive", status="OK", rows=len(detail), seconds=0,
-                          error=f"{(detail.status != 'OK').sum() if len(detail) else 0} tables skipped"))
+                          error=f"{n_hot - len(cands)} of {n_hot} hot tables not inspectable (views, dropped or no privilege); "
+                                f"{(detail.status != 'OK').sum() if len(detail) else 0} skipped on DESCRIBE"))
     if len(detail):
         display(detail)
 
@@ -424,12 +463,13 @@ if len(inv):
 
 po = maint = pd.DataFrame()
 if ok("system.storage.predictive_optimization_operations_history"):
+    po_f = uc("catalog_name", "schema_name")
     po = q("5a Predictive optimisation operations", f"""
         SELECT workspace_id, catalog_name, operation_type, operation_status,
                COUNT(*) AS operations, COUNT(DISTINCT table_id) AS tables, MAX(start_time) AS last_operation,
                ROUND(SUM(usage_quantity), 1) AS dbus
         FROM system.storage.predictive_optimization_operations_history
-        WHERE start_time >= current_date() - INTERVAL {D} DAYS {ws()}
+        WHERE start_time >= current_date() - INTERVAL {D} DAYS {ws()} {po_f}
         GROUP BY ALL ORDER BY operations DESC""")
     if len(po):
         tot = po.operations.sum()
@@ -445,7 +485,7 @@ if ok("system.storage.predictive_optimization_operations_history"):
                         "firewall. Re-check this table after the fix.",
                         5 if share >= 0.5 else 3, 5 if share >= 0.5 else 3, "S")
     else:
-        add_finding("Maintenance", "Predictive optimisation has not run", "all catalogs",
+        add_finding("Maintenance", "Predictive optimisation has not run", "all catalogs" if not UC_FILTERED else UC_SCOPE,
                     f"No PO operations recorded in {D} days",
                     "Enable predictive optimisation at the account/metastore level (it only acts on UC managed tables). "
                     "If private networking is used, configure NCC for serverless first.", 4, 5, "S")
@@ -865,7 +905,8 @@ display(pd.DataFrame(CHECK_LOG))
 
 if OUTPUT_TABLE and len(findings):
     out = spark.createDataFrame(findings.astype(str)).selectExpr("*", "current_timestamp() AS run_ts",
-                                                                 f"{D} AS lookback_days", f"'{','.join(WS_IDS) or 'all'}' AS workspace_scope")
+                                                                 f"{D} AS lookback_days", f"'{','.join(WS_IDS) or 'all'}' AS workspace_scope",
+                                                                 f"'{UC_SCOPE}' AS table_scope")
     out.write.mode("append").option("mergeSchema", "true").saveAsTable(OUTPUT_TABLE)
     print(f"Saved {len(findings)} findings to {OUTPUT_TABLE}")
 else:
@@ -875,5 +916,5 @@ else:
 
 # Return a compact summary when run as a job (for example, to schedule this health check)
 dbutils.notebook.exit(json.dumps({
-    "findings": len(findings), "by_priority": findings.priority.value_counts().to_dict() if len(findings) else {},
+    "findings": len(findings), "table_scope": UC_SCOPE, "by_priority": findings.priority.value_counts().to_dict() if len(findings) else {},
     "checks": CHECK_LOG, "deep_dive_status": detail.status.str[:90].value_counts().to_dict() if len(detail) else {}, "top10": findings.head(10)[["rank", "priority", "score", "check", "object"]].astype(str).to_dict("records")}))
